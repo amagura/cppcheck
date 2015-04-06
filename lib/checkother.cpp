@@ -1490,6 +1490,7 @@ bool CheckOther::checkInnerScope(const Token *tok, const Variable* var, bool& us
 
 void CheckOther::variableScopeError(const Token *tok, const std::string &varname)
 {
+#if 0
     reportError(tok,
                 Severity::style,
                 "variableScope",
@@ -1509,6 +1510,7 @@ void CheckOther::variableScopeError(const Token *tok, const std::string &varname
                 "    }\n"
                 "}\n"
                 "When you see this message it is always safe to reduce the variable scope 1 level.");
+#endif
 }
 
 //---------------------------------------------------------------------------
