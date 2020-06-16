@@ -150,8 +150,8 @@
 #endif
 
 namespace {
-    struct VerifyException {
-        VerifyException(const Token *tok, const std::string &what) : tok(tok), what(what) {}
+    struct BugHuntingException {
+        BugHuntingException(const Token *tok, const std::string &what) : tok(tok), what(what) {}
         const Token *tok;
         const std::string what;
     };
@@ -204,7 +204,6 @@ namespace {
                 return;
             mSymbols.insert(symbolicExpression);
             mMap[tok].push_back(symbolicExpression + "=" + value->getRange());
-
         }
 
         void state(const Token *tok, const std::string &s) {
@@ -342,7 +341,8 @@ namespace {
             mTrackExecution->symbolRange(tok, value);
             if (value) {
                 if (auto arr = std::dynamic_pointer_cast<ExprEngine::ArrayValue>(value)) {
-                    mTrackExecution->symbolRange(tok, arr->size);
+                    for (const auto &dim: arr->size)
+                        mTrackExecution->symbolRange(tok, dim);
                     for (const auto &indexAndValue: arr->data)
                         mTrackExecution->symbolRange(tok, indexAndValue.value);
                 } else if (auto s = std::dynamic_pointer_cast<ExprEngine::StructValue>(value)) {
@@ -564,7 +564,7 @@ static int128_t truncateInt(int128_t value, int bits, char sign)
 ExprEngine::ArrayValue::ArrayValue(const std::string &name, ExprEngine::ValuePtr size, ExprEngine::ValuePtr value, bool pointer, bool nullPointer, bool uninitPointer)
     : Value(name, ExprEngine::ValueType::ArrayValue)
     , pointer(pointer), nullPointer(nullPointer), uninitPointer(uninitPointer)
-    , size(size)
+    , size{size}
 {
     assign(ExprEngine::ValuePtr(), value);
 }
@@ -574,17 +574,16 @@ ExprEngine::ArrayValue::ArrayValue(DataBase *data, const Variable *var)
     , pointer(var->isPointer()), nullPointer(var->isPointer()), uninitPointer(var->isPointer())
 {
     if (var) {
-        int sz = 1;
         for (const auto &dim : var->dimensions()) {
-            if (!dim.known) {
-                sz = -1;
-                break;
-            }
-            sz *= dim.num;
+            if (dim.known)
+                size.push_back(std::make_shared<ExprEngine::IntRange>(std::to_string(dim.num), dim.num, dim.num));
+            else
+                size.push_back(std::make_shared<ExprEngine::IntRange>(data->getNewSymbolName(), 1, ExprEngine::ArrayValue::MAXSIZE));
         }
-        if (sz >= 1)
-            size = std::make_shared<ExprEngine::IntRange>(std::to_string(sz), sz, sz);
+    } else {
+        size.push_back(std::make_shared<ExprEngine::IntRange>(data->getNewSymbolName(), 1, ExprEngine::ArrayValue::MAXSIZE));
     }
+
     ValuePtr val;
     if (var && !var->isGlobal() && !var->isStatic())
         val = std::make_shared<ExprEngine::UninitValue>();
@@ -727,7 +726,12 @@ std::string ExprEngine::ConditionalValue::getSymbolicExpression() const
 std::string ExprEngine::ArrayValue::getSymbolicExpression() const
 {
     std::ostringstream ostr;
-    ostr << "size=" << (size ? size->name : std::string("(null)"));
+    if (size.empty())
+        ostr << "(null)";
+    else {
+        for (const auto &dim: size)
+            ostr << "[" << (dim ? dim->name : std::string("(null)")) << "]";
+    }
     for (const auto &indexAndValue : data) {
         ostr << ",["
              << (!indexAndValue.index ? std::string(":") : indexAndValue.index->name)
@@ -834,12 +838,12 @@ struct ExprData {
             return op1 * z3::pw(context.int_val(2), op2);
         if (b->binop == ">>")
             return op1 / z3::pw(context.int_val(2), op2);
-        throw VerifyException(nullptr, "Internal error: Unhandled operator " + b->binop);
+        throw BugHuntingException(nullptr, "Internal error: Unhandled operator " + b->binop);
     }
 
     z3::expr getExpr(ExprEngine::ValuePtr v) {
         if (!v)
-            throw VerifyException(nullptr, "Can not solve expressions, operand value is null");
+            throw BugHuntingException(nullptr, "Can not solve expressions, operand value is null");
         if (auto intRange = std::dynamic_pointer_cast<ExprEngine::IntRange>(v)) {
             if (intRange->name[0] != '$')
 #if Z3_VERSION_INT >= GET_VERSION_INT(4,7,1)
@@ -866,7 +870,7 @@ struct ExprData {
 
         if (auto c = std::dynamic_pointer_cast<ExprEngine::ConditionalValue>(v)) {
             if (c->values.empty())
-                throw VerifyException(nullptr, "ConditionalValue is empty");
+                throw BugHuntingException(nullptr, "ConditionalValue is empty");
 
             if (c->values.size() == 1)
                 return getExpr(c->values[0].second);
@@ -884,7 +888,7 @@ struct ExprData {
         if (v->type == ExprEngine::ValueType::UninitValue)
             return context.int_val(0);
 
-        throw VerifyException(nullptr, "Internal error: Unhandled value type");
+        throw BugHuntingException(nullptr, "Internal error: Unhandled value type");
     }
 
     z3::expr getConstraintExpr(ExprEngine::ValuePtr v) {
@@ -1242,8 +1246,8 @@ static void call(const std::vector<ExprEngine::Callback> &callbacks, const Token
         for (ExprEngine::Callback f : callbacks) {
             try {
                 f(tok, *value, dataBase);
-            } catch (const VerifyException &e) {
-                throw VerifyException(tok, e.what);
+            } catch (const BugHuntingException &e) {
+                throw BugHuntingException(tok, e.what);
             }
         }
     }
@@ -1251,6 +1255,47 @@ static void call(const std::vector<ExprEngine::Callback> &callbacks, const Token
 
 static ExprEngine::ValuePtr executeExpression(const Token *tok, Data &data);
 static ExprEngine::ValuePtr executeExpression1(const Token *tok, Data &data);
+
+static ExprEngine::ValuePtr calculateArrayIndex(const Token *tok, Data &data, const ExprEngine::ArrayValue &arrayValue)
+{
+    int nr = 1;
+    const Token *tok2 = tok;
+    while (Token::simpleMatch(tok2->astOperand1(), "[")) {
+        tok2 = tok2->astOperand1();
+        nr++;
+    }
+
+    ExprEngine::ValuePtr totalIndex;
+    ExprEngine::ValuePtr dim;
+    while (Token::simpleMatch(tok, "[")) {
+        auto rawIndex = executeExpression(tok->astOperand2(), data);
+
+        ExprEngine::ValuePtr index;
+        if (dim)
+            index = simplifyValue(std::make_shared<ExprEngine::BinOpResult>("*", dim, rawIndex));
+        else
+            index = rawIndex;
+
+        if (!totalIndex)
+            totalIndex = index;
+        else
+            totalIndex = simplifyValue(std::make_shared<ExprEngine::BinOpResult>("+", index, totalIndex));
+
+        if (arrayValue.size.size() >= nr) {
+            if (arrayValue.size[nr-1]) {
+                if (!dim)
+                    dim = arrayValue.size[nr-1];
+                else
+                    dim = simplifyValue(std::make_shared<ExprEngine::BinOpResult>("*", dim, arrayValue.size[nr-1]));
+            }
+        }
+
+        nr--;
+        tok = tok->astOperand1();
+    }
+
+    return totalIndex;
+}
 
 static ExprEngine::ValuePtr executeReturn(const Token *tok, Data &data)
 {
@@ -1314,7 +1359,7 @@ static ExprEngine::ValuePtr executeAssign(const Token *tok, Data &data)
     }
 
     if (!rhsValue)
-        throw VerifyException(tok, "Expression '" + tok->expressionString() + "'; Failed to evaluate RHS");
+        throw BugHuntingException(tok, "Expression '" + tok->expressionString() + "'; Failed to evaluate RHS");
 
     ExprEngine::ValuePtr assignValue;
     if (tok->str() == "=")
@@ -1334,15 +1379,18 @@ static ExprEngine::ValuePtr executeAssign(const Token *tok, Data &data)
     if (lhsToken->varId() > 0) {
         data.assignValue(lhsToken, lhsToken->varId(), assignValue);
     } else if (lhsToken->str() == "[") {
-        auto arrayValue = data.getArrayValue(lhsToken->astOperand1());
+        const Token *tok2 = lhsToken;
+        while (Token::simpleMatch(tok2->astOperand1(), "["))
+            tok2 = tok2->astOperand1();
+        auto arrayValue = data.getArrayValue(tok2->astOperand1());
         if (arrayValue) {
             // Is it array initialization?
-            const Token *arrayInit = lhsToken->astOperand1();
+            const Token *arrayInit = tok2->astOperand1();
             if (arrayInit && arrayInit->variable() && arrayInit->variable()->nameToken() == arrayInit) {
                 if (assignValue->type == ExprEngine::ValueType::StringLiteralValue)
                     arrayValue->assign(ExprEngine::ValuePtr(), assignValue);
             } else {
-                auto indexValue = executeExpression(lhsToken->astOperand2(), data);
+                auto indexValue = calculateArrayIndex(lhsToken, data, *arrayValue);
                 arrayValue->assign(indexValue, assignValue);
             }
         }
@@ -1436,7 +1484,7 @@ static void checkContract(Data &data, const Token *tok, const Function *function
         }
     } catch (const z3::exception &exception) {
         std::cerr << "z3: " << exception << std::endl;
-    } catch (const VerifyException &e) {
+    } catch (const BugHuntingException &e) {
         std::list<const Token*> callstack{tok};
         const char * const id = "internalErrorInExprEngine";
         const auto contractIt = data.settings->functionContracts.find(function->fullName());
@@ -1511,9 +1559,12 @@ static ExprEngine::ValuePtr executeFunctionCall(const Token *tok, Data &data)
 
 static ExprEngine::ValuePtr executeArrayIndex(const Token *tok, Data &data)
 {
-    auto arrayValue = data.getArrayValue(tok->astOperand1());
+    const Token *tok2 = tok;
+    while (Token::simpleMatch(tok2->astOperand1(), "["))
+        tok2 = tok2->astOperand1();
+    auto arrayValue = data.getArrayValue(tok2->astOperand1());
     if (arrayValue) {
-        auto indexValue = executeExpression(tok->astOperand2(), data);
+        auto indexValue = calculateArrayIndex(tok, data, *arrayValue);
         auto conditionalValues = arrayValue->read(indexValue);
         for (auto value: conditionalValues)
             call(data.callbacks, tok, value.second, &data);
@@ -1813,7 +1864,7 @@ static void execute(const Token *start, const Token *end, Data &data, int recurs
 
         if (Token::simpleMatch(tok, "try"))
             // TODO this is a bailout
-            throw VerifyException(tok, "Unhandled:" + tok->str());
+            throw BugHuntingException(tok, "Unhandled:" + tok->str());
 
         // Variable declaration..
         if (tok->variable() && tok->variable()->nameToken() == tok) {
@@ -1859,7 +1910,7 @@ static void execute(const Token *start, const Token *end, Data &data, int recurs
             auto exec = [&](const Token *tok1, const Token *tok2, Data& data) {
                 try {
                     execute(tok1, tok2, data, recursion);
-                } catch (VerifyException &e) {
+                } catch (BugHuntingException &e) {
                     if (!exceptionToken || (e.tok && precedes(e.tok, exceptionToken))) {
                         exceptionToken = e.tok;
                         exceptionMessage = e.what;
@@ -1877,7 +1928,7 @@ static void execute(const Token *start, const Token *end, Data &data, int recurs
             }
 
             if (exceptionToken)
-                throw VerifyException(exceptionToken, exceptionMessage);
+                throw BugHuntingException(exceptionToken, exceptionMessage);
             return;
         }
 
@@ -1892,7 +1943,7 @@ static void execute(const Token *start, const Token *end, Data &data, int recurs
             auto exec = [&](const Token *tok1, const Token *tok2, Data& data) {
                 try {
                     execute(tok1, tok2, data, recursion);
-                } catch (VerifyException &e) {
+                } catch (BugHuntingException &e) {
                     if (!exceptionToken || (e.tok && precedes(e.tok, exceptionToken))) {
                         exceptionToken = e.tok;
                         exceptionMessage = e.what;
@@ -1917,7 +1968,7 @@ static void execute(const Token *start, const Token *end, Data &data, int recurs
             }
             exec(defaultStart ? defaultStart : bodyEnd, end, defaultData);
             if (exceptionToken)
-                throw VerifyException(exceptionToken, exceptionMessage);
+                throw BugHuntingException(exceptionToken, exceptionMessage);
             return;
         }
 
@@ -1929,13 +1980,18 @@ static void execute(const Token *start, const Token *end, Data &data, int recurs
             std::set<int> changedVariables;
             for (const Token *tok2 = tok; tok2 != bodyEnd; tok2 = tok2->next()) {
                 if (Token::Match(tok2, "%assign%")) {
-                    if (Token::Match(tok2->astOperand1(), ". %name% =") && tok2->astOperand1()->astOperand1() && tok2->astOperand1()->astOperand1()->valueType()) {
-                        const Token *structToken = tok2->astOperand1()->astOperand1();
+                    const Token *lhs = tok2->astOperand1();
+                    while (Token::simpleMatch(lhs, "["))
+                        lhs = lhs->astOperand1();
+                    if (!lhs)
+                        throw BugHuntingException(tok2, "Unhandled assignment in loop");
+                    if (Token::Match(lhs, ". %name% =|[") && lhs->astOperand1() && lhs->astOperand1()->valueType()) {
+                        const Token *structToken = lhs->astOperand1();
                         if (!structToken->valueType() || !structToken->varId())
-                            throw VerifyException(tok2, "Unhandled assignment in loop");
+                            throw BugHuntingException(tok2, "Unhandled assignment in loop");
                         const Scope *structScope = structToken->valueType()->typeScope;
                         if (!structScope)
-                            throw VerifyException(tok2, "Unhandled assignment in loop");
+                            throw BugHuntingException(tok2, "Unhandled assignment in loop");
                         const std::string &memberName = tok2->previous()->str();
                         ExprEngine::ValuePtr memberValue;
                         for (const Variable &member : structScope->varlist) {
@@ -1945,42 +2001,46 @@ static void execute(const Token *start, const Token *end, Data &data, int recurs
                             }
                         }
                         if (!memberValue)
-                            throw VerifyException(tok2, "Unhandled assignment in loop");
+                            throw BugHuntingException(tok2, "Unhandled assignment in loop");
 
                         ExprEngine::ValuePtr structVal1 = data.getValue(structToken->varId(), structToken->valueType(), structToken);
                         if (!structVal1)
                             structVal1 = createVariableValue(*structToken->variable(), data);
                         auto structVal = std::dynamic_pointer_cast<ExprEngine::StructValue>(structVal1);
                         if (!structVal)
-                            throw VerifyException(tok2, "Unhandled assignment in loop");
+                            throw BugHuntingException(tok2, "Unhandled assignment in loop");
 
                         data.assignStructMember(tok2, &*structVal, memberName, memberValue);
                         continue;
                     }
-                    if (tok2->astOperand1() && tok2->astOperand1()->isUnaryOp("*") && tok2->astOperand1()->astOperand1()->varId()) {
+                    if (lhs->isUnaryOp("*") && lhs->astOperand1()->varId()) {
                         const Token *varToken = tok2->astOperand1()->astOperand1();
                         ExprEngine::ValuePtr val = data.getValue(varToken->varId(), varToken->valueType(), varToken);
                         if (val && val->type == ExprEngine::ValueType::ArrayValue) {
                             // Try to assign "any" value
                             auto arrayValue = std::dynamic_pointer_cast<ExprEngine::ArrayValue>(val);
-                            //ExprEngine::ValuePtr anyValue = getValueRangeFromValueType(data.getNewSymbolName(), tok2->astOperand1()->valueType(), *data.settings);
                             arrayValue->assign(std::make_shared<ExprEngine::IntRange>("0", 0, 0), std::make_shared<ExprEngine::BailoutValue>());
                             continue;
                         }
                     }
-                    if (!Token::Match(tok2->astOperand1(), "%var%"))
-                        throw VerifyException(tok2, "Unhandled assignment in loop");
-                    if (!tok2->astOperand1()->variable())
-                        throw VerifyException(tok2, "Unhandled assignment in loop");
+                    if (!lhs->variable())
+                        throw BugHuntingException(tok2, "Unhandled assignment in loop");
                     // give variable "any" value
-                    int varid = tok2->astOperand1()->varId();
+                    int varid = lhs->varId();
                     if (changedVariables.find(varid) != changedVariables.end())
                         continue;
                     changedVariables.insert(varid);
                     auto oldValue = data.getValue(varid, nullptr, nullptr);
                     if (oldValue && oldValue->isUninit())
-                        call(data.callbacks, tok2->astOperand1(), oldValue, &data);
-                    data.assignValue(tok2, varid, getValueRangeFromValueType(data.getNewSymbolName(), tok2->astOperand1()->valueType(), *data.settings));
+                        call(data.callbacks, lhs, oldValue, &data);
+                    if (oldValue && oldValue->type == ExprEngine::ValueType::ArrayValue) {
+                        // Try to assign "any" value
+                        auto arrayValue = std::dynamic_pointer_cast<ExprEngine::ArrayValue>(oldValue);
+                        arrayValue->assign(std::make_shared<ExprEngine::IntRange>(data.getNewSymbolName(), 0, ~0ULL), std::make_shared<ExprEngine::BailoutValue>());
+                        continue;
+                    }
+                    data.assignValue(tok2, varid, getValueRangeFromValueType(data.getNewSymbolName(), lhs->valueType(), *data.settings));
+                    continue;
                 } else if (Token::Match(tok2, "++|--") && tok2->astOperand1() && tok2->astOperand1()->variable()) {
                     // give variable "any" value
                     const Token *vartok = tok2->astOperand1();
@@ -2007,7 +2067,7 @@ void ExprEngine::executeAllFunctions(ErrorLogger *errorLogger, const Tokenizer *
     for (const Scope *functionScope : symbolDatabase->functionScopes) {
         try {
             executeFunction(functionScope, errorLogger, tokenizer, settings, callbacks, report);
-        } catch (const VerifyException &e) {
+        } catch (const BugHuntingException &e) {
             // FIXME.. there should not be exceptions
             std::string functionName = functionScope->function->name();
             std::cout << "Verify: Aborted analysis of function '" << functionName << "':" << e.tok->linenr() << ": " << e.what << std::endl;
@@ -2133,9 +2193,9 @@ void ExprEngine::executeFunction(const Scope *functionScope, ErrorLogger *errorL
 
     try {
         execute(functionScope->bodyStart, functionScope->bodyEnd, data);
-    } catch (VerifyException &e) {
+    } catch (BugHuntingException &e) {
         if (settings->debugBugHunting)
-            report << "VerifyException tok.line:" << e.tok->linenr() << " what:" << e.what << "\n";
+            report << "BugHuntingException tok.line:" << e.tok->linenr() << " what:" << e.what << "\n";
         trackExecution.setAbortLine(e.tok->linenr());
         auto bailoutValue = std::make_shared<BailoutValue>();
         for (const Token *tok = e.tok; tok != functionScope->bodyEnd; tok = tok->next()) {

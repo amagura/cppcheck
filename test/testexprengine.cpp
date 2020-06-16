@@ -70,9 +70,11 @@ private:
         TEST_CASE(array2);
         TEST_CASE(array3);
         TEST_CASE(array4);
+        TEST_CASE(array5);
         TEST_CASE(arrayInit1);
         TEST_CASE(arrayInit2);
         TEST_CASE(arrayUninit);
+        TEST_CASE(arrayInLoop);
 
         TEST_CASE(floatValue1);
         TEST_CASE(floatValue2);
@@ -508,7 +510,20 @@ private:
                             "void f() { int x = buf[0]; }";
         ASSERT_EQUALS("2:16: $2:0=-2147483648:2147483647\n"
                       "2:20: $2=-2147483648:2147483647\n"
-                      "2:26: { buf=($1,size=10,[:]=$2) x=$2:0}\n",
+                      "2:26: { buf=($1,[10],[:]=$2) x=$2:0}\n",
+                      trackExecution(code));
+    }
+
+    void array5() {
+        const char code[] = "int f(int x) {\n"
+                            "  int buf[3][4][5];\n"
+                            "  buf[x][1][2] = 10;\n"
+                            "  return buf[0][1][2];\n"
+                            "}";
+        ASSERT_EQUALS("1:14: $1=-2147483648:2147483647\n"
+                      "1:14: { x=$1}\n"
+                      "2:19: { x=$1 buf=($2,[3][4][5],[:]=?)}\n"
+                      "3:20: { x=$1 buf=($2,[3][4][5],[:]=?,[((20)*($1))+(7)]=10)}\n",
                       trackExecution(code));
     }
 
@@ -522,6 +537,15 @@ private:
 
     void arrayUninit() {
         ASSERT_EQUALS("?", getRange("int f() { int arr[10]; return arr[4]; }", "arr[4]"));
+    }
+
+    void arrayInLoop() {
+        const char code[] = "void f() {\n"
+                            "  int arr[3][3];\n"
+                            "  for (int i = 0; i < 3; i++) arr[i][0] = arr[1][2];\n"
+                            "  return arr[0][0];"
+                            "}";
+        ASSERT_EQUALS("?", getRange(code, "arr[1][2]"));
     }
 
 
@@ -591,7 +615,7 @@ private:
 
     void pointer1() {
         const char code[] = "void f(unsigned char *p) { return *p == 7; }";
-        ASSERT_EQUALS("size=$1,[:]=?,null", getRange(code, "p"));
+        ASSERT_EQUALS("[$1],[:]=?,null", getRange(code, "p"));
         ASSERT_EQUALS("(and (>= $3 0) (<= $3 255))\n"
                       "(= $3 7)\n"
                       "z3::sat\n",
